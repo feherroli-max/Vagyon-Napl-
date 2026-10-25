@@ -2,6 +2,7 @@ package hu.vagyonnaplo.app
 
 import android.app.DatePickerDialog
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -80,16 +81,52 @@ class MainActivity: ComponentActivity() {
     var ledger by remember { mutableStateOf(Ledger()) }
     var screen by remember { mutableStateOf("home") }
     var person by remember { mutableStateOf("") }
-    var draft by remember { mutableStateOf(mapOf<String,String>()) }
+    // Nem mentett, személyenként külön tárolt űrlapadatok; zároláskor is megmaradnak.
+    var drafts by remember { mutableStateOf(mapOf<String,Map<String,String>>()) }
+    var notes by remember { mutableStateOf(mapOf<String,String>()) }
+    var dates by remember { mutableStateOf(mapOf<String,Long>()) }
+    val draft = drafts[person].orEmpty()
     var message by remember { mutableStateOf("") }
+    // Egy perc türelmi idő az alkalmazások közötti váltáshoz.
+    // A monotón óra az idő/dátum kézi módosításától független.
+    var backgroundAt by remember { mutableStateOf<Long?>(null) }
     val lifecycle=LocalLifecycleOwner.current
     DisposableEffect(lifecycle) {
-        val observer=LifecycleEventObserver { _,event -> if(event==Lifecycle.Event.ON_STOP) { unlocked=false; password=""; ledger=Ledger(); draft=emptyMap(); screen="home" } }
+        val observer=LifecycleEventObserver { _,event ->
+            when(event) {
+                Lifecycle.Event.ON_STOP -> {
+                    if (unlocked) backgroundAt = SystemClock.elapsedRealtime()
+                }
+                Lifecycle.Event.ON_START -> {
+                    val leftAt = backgroundAt
+                    if (unlocked && leftAt != null &&
+                        (SystemClock.elapsedRealtime() - leftAt >= 60_000L ||
+                         SystemClock.elapsedRealtime() < leftAt)) {
+                        unlocked = false
+                        password = ""
+                        ledger = Ledger()
+                        screen = "home"
+                    }
+                    backgroundAt = null
+                }
+                else -> Unit
+            }
+        }
         lifecycle.lifecycle.addObserver(observer)
         onDispose { lifecycle.lifecycle.removeObserver(observer) }
     }
     fun persist(next: Ledger) { try { Vault.save(ctx,next,password); ledger=next; message="Mentve" } catch(e:Exception) { message="Mentési hiba: ${e.message}" } }
-    fun resetDraft(p: String, l: Ledger=ledger) { draft=l.accounts.filter { it.personId==p && it.active }.associate { it.id to balance(l,p,it.id).toString() } }
+    fun resetDraft(p: String, l: Ledger=ledger) {
+        drafts = drafts + (p to l.accounts.filter { it.personId==p && it.active }.associate { it.id to balance(l,p,it.id).toString() })
+    }
+    fun initDraftIfMissing(p: String, l: Ledger=ledger) {
+        if(p !in drafts) resetDraft(p,l)
+        else {
+            val existing=drafts[p].orEmpty()
+            val active=l.accounts.filter { it.personId==p && it.active }
+            drafts=drafts+(p to active.associate { it.id to (existing[it.id] ?: balance(l,p,it.id).toString()) })
+        }
+    }
     if(!unlocked) {
         LockScreen(Vault.exists(ctx), { pass ->
             try {
@@ -97,13 +134,15 @@ class MainActivity: ComponentActivity() {
                     ledger=Ledger(people=listOf(Person(id(),"Én")))
                     Vault.save(ctx,ledger,pass)
                 }
-                password=pass; unlocked=true; person=ledger.people.firstOrNull()?.id.orEmpty(); resetDraft(person,ledger); message=""
+                password=pass; unlocked=true
+                if(ledger.people.none { it.id==person }) person=ledger.people.firstOrNull()?.id.orEmpty()
+                initDraftIfMissing(person,ledger); message=""
                 true
             } catch(e:Exception) { message="Hibás jelszó vagy sérült adatfájl"; false }
         },message)
         return
     }
-    if(person.isEmpty() && ledger.people.isNotEmpty()) { person=ledger.people.first().id; resetDraft(person) }
+    if(person.isEmpty() && ledger.people.isNotEmpty()) { person=ledger.people.first().id; initDraftIfMissing(person) }
     Scaffold(containerColor=bg,bottomBar={ NavigationBar(containerColor=card) {
         listOf(Triple("home","Vagyon",Icons.Default.AccountBalanceWallet),Triple("stats","Statisztika",Icons.Default.ShowChart),Triple("history","Előzmények",Icons.Default.History),Triple("settings","Beállítások",Icons.Default.Settings)).forEach { (s,label,ico) ->
             NavigationBarItem(selected=screen==s,onClick={screen=s},icon={Icon(ico,null)},label={Text(label,fontSize=10.sp)})
@@ -111,10 +150,16 @@ class MainActivity: ComponentActivity() {
     } }, snackbarHost={ if(message.isNotBlank()) LaunchedEffect(message) { kotlinx.coroutines.delay(2600); message="" } }) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
             when(screen) {
-                "home" -> Home(ledger,person,draft,{person=it;resetDraft(it)},{a,v->draft=draft+(a to v)},{persist(it);resetDraft(person,it)},{persist(it);resetDraft(person,it)})
+                "home" -> Home(ledger,person,draft,
+                    notes[person].orEmpty(),dates[person] ?: System.currentTimeMillis(),
+                    {person=it;initDraftIfMissing(it)},
+                    {a,v->drafts=drafts+(person to (drafts[person].orEmpty()+(a to v)))},
+                    {notes=notes+(person to it)}, {dates=dates+(person to it)},
+                    {persist(it);resetDraft(person,it);notes=notes+(person to "");dates=dates+(person to System.currentTimeMillis())},
+                    {persist(it);initDraftIfMissing(person,it)})
                 "stats" -> Stats(ledger)
-                "history" -> History(ledger,person,{person=it;resetDraft(it)},{persist(it)})
-                "settings" -> Settings(ledger,password,{persist(it);if(!it.people.any { p->p.id==person }) { person=it.people.firstOrNull()?.id.orEmpty() };resetDraft(person)},{password=it}, {unlocked=false;password="";ledger=Ledger()}, {message=it})
+                "history" -> History(ledger,person,{person=it;initDraftIfMissing(it)},{persist(it)})
+                "settings" -> Settings(ledger,password,{persist(it);if(!it.people.any { p->p.id==person }) { person=it.people.firstOrNull()?.id.orEmpty() };resetDraft(person)},{password=it}, {unlocked=false;password="";ledger=Ledger();drafts=emptyMap();notes=emptyMap();dates=emptyMap();person=""}, {message=it})
             }
         }
     }
@@ -147,23 +192,23 @@ class MainActivity: ComponentActivity() {
 @Composable private fun Metric(title:String,value:String,highlight:Color=Color.White) {
     Column(Modifier.background(card,RoundedCornerShape(18.dp)).padding(18.dp)) { Text(title,color=muted,fontSize=13.sp); Spacer(Modifier.height(6.dp)); Text(value,fontSize=23.sp,fontWeight=FontWeight.Bold,color=highlight) }
 }
-@Composable private fun Home(l:Ledger,person:String,draft:Map<String,String>,onPerson:(String)->Unit,onDraft:(String,String)->Unit,onSave:(Ledger)->Unit,onCategory:(Ledger)->Unit) {
+@Composable private fun Home(l:Ledger,person:String,draft:Map<String,String>,note:String,chosenDate:Long,
+    onPerson:(String)->Unit,onDraft:(String,String)->Unit,onNote:(String)->Unit,onDate:(Long)->Unit,
+    onSave:(Ledger)->Unit,onCategory:(Ledger)->Unit) {
     val accounts=l.accounts.filter { it.personId==person && it.active }
     val old=total(l,person)
     val current=accounts.sumOf { (draft[it.id]?.toLongOrNull() ?: 0L) }
     val diff=current-old
-    var note by remember(person) { mutableStateOf("") }
-    var chosenDate by remember(person) { mutableLongStateOf(System.currentTimeMillis()) }
     val context = LocalContext.current
     fun chooseDate() {
         val calendar = Calendar.getInstance().apply { timeInMillis = chosenDate }
         DatePickerDialog(context, { _, year, month, day ->
-            chosenDate = Calendar.getInstance().apply {
+            onDate(Calendar.getInstance().apply {
                 timeInMillis = chosenDate
                 set(Calendar.YEAR, year)
                 set(Calendar.MONTH, month)
                 set(Calendar.DAY_OF_MONTH, day)
-            }.timeInMillis
+            }.timeInMillis)
         }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)).apply {
             datePicker.maxDate = System.currentTimeMillis()
         }.show()
@@ -204,7 +249,7 @@ class MainActivity: ComponentActivity() {
                 Text("Rögzítés dátuma",color=muted)
                 TextButton(onClick={chooseDate()}) { Icon(Icons.Default.CalendarMonth,null); Spacer(Modifier.width(6.dp)); Text(SimpleDateFormat("yyyy. MM. dd.",Locale("hu","HU")).format(Date(chosenDate))) }
             }
-            OutlinedTextField(note,{note=it},label={Text("Megjegyzés (opcionális)")},placeholder={Text("Pl. ablakcsere")},modifier=Modifier.fillMaxWidth(),maxLines=3)
+            OutlinedTextField(note,onNote,label={Text("Megjegyzés (opcionális)")},placeholder={Text("Pl. ablakcsere")},modifier=Modifier.fillMaxWidth(),maxLines=3)
             Spacer(Modifier.height(12.dp))
             Button(onClick={
                 if(accounts.isEmpty()) warning="Előbb hozz létre legalább egy kategóriát"
@@ -217,7 +262,7 @@ class MainActivity: ComponentActivity() {
     if(warning.isNotBlank()) AlertDialog(onDismissRequest={warning=""},confirmButton={TextButton(onClick={warning=""}){Text("OK")}},title={Text("Figyelem")},text={Text(warning)})
     if(confirm) AlertDialog(onDismissRequest={confirm=false},title={Text("Állapot rögzítése")},text={Column { Text("Dátum: ${date(chosenDate)}");Text("Új állomány: ${money(current)}");Text("Változás: ${signed(diff)}",color=if(diff<0)red else green);if(note.isNotBlank()) Text("Megjegyzés: $note") }},confirmButton={TextButton(onClick={
         val snap=Snapshot(id(),person,chosenDate,note,l.accounts.filter { it.personId==person }.map { a -> Entry(a.id,if(a.active) draft[a.id]!!.toLong() else balance(l,person,a.id)) })
-        onSave(l.copy(snapshots=l.snapshots+snap));note="";chosenDate=System.currentTimeMillis();confirm=false
+        onSave(l.copy(snapshots=l.snapshots+snap));confirm=false
     }) { Text("Mentés") }},dismissButton={TextButton(onClick={confirm=false}){Text("Mégse")}})
     if(add || edit!=null) AccountEditor(edit,onDismiss={add=false;edit=null},onApply={updated->
         val originalId=edit?.id
