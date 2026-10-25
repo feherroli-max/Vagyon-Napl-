@@ -124,7 +124,7 @@ class MainActivity: ComponentActivity() {
 @Composable private fun LockScreen(exists:Boolean, onUnlock:(String)->Boolean, error:String) {
     var pw by remember { mutableStateOf("") }; var confirm by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().background(bg).padding(28.dp),horizontalAlignment=Alignment.CenterHorizontally,verticalArrangement=Arrangement.Center) {
-        Icon(Icons.Default.Lock,color=accent,contentDescription=null,modifier=Modifier.size(60.dp))
+        Icon(Icons.Default.Lock,tint=accent,contentDescription=null,modifier=Modifier.size(60.dp))
         Spacer(Modifier.height(22.dp)); Text(if(exists) "Üdvözlünk újra!" else "Vagyon Napló beállítása",fontSize=25.sp,fontWeight=FontWeight.Bold)
         Spacer(Modifier.height(10.dp)); Text(if(exists) "Add meg az alkalmazás saját jelszavát" else "Hozz létre egy saját, legalább 8 karakteres jelszót",color=muted)
         Spacer(Modifier.height(24.dp))
@@ -202,7 +202,7 @@ class MainActivity: ComponentActivity() {
             Spacer(Modifier.height(12.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement=Arrangement.SpaceBetween, verticalAlignment=Alignment.CenterVertically) {
                 Text("Rögzítés dátuma",color=muted)
-                TextButton(onClick={chooseDate}) { Icon(Icons.Default.CalendarMonth,null); Spacer(Modifier.width(6.dp)); Text(SimpleDateFormat("yyyy. MM. dd.",Locale("hu","HU")).format(Date(chosenDate))) }
+                TextButton(onClick={chooseDate()}) { Icon(Icons.Default.CalendarMonth,null); Spacer(Modifier.width(6.dp)); Text(SimpleDateFormat("yyyy. MM. dd.",Locale("hu","HU")).format(Date(chosenDate))) }
             }
             OutlinedTextField(note,{note=it},label={Text("Megjegyzés (opcionális)")},placeholder={Text("Pl. ablakcsere")},modifier=Modifier.fillMaxWidth(),maxLines=3)
             Spacer(Modifier.height(12.dp))
