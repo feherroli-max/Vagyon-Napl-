@@ -30,6 +30,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -292,41 +293,102 @@ class MainActivity: ComponentActivity() {
 private data class Point(val time:Long,val amount:Long,val note:String)
 private fun timeline(l:Ledger,person:String,account:String,start:Long,end:Long):List<Point> {
     val selected=if(person=="ALL") l.people.map { it.id }.toSet() else setOf(person)
-    val relevantAccounts=l.accounts.filter { it.personId in selected && (account=="ALL" || it.name==account) }.map { it.id }.toSet()
-    // A grafikon csak az első ténylegesen rögzített, kiválasztott egyenlegtől indul.
-    // A 0 Ft valódi mentett érték lehet; a hiányzó előzmény viszont NEM nulla.
+    val matching=l.accounts.filter { it.personId in selected && (account=="ALL" || it.name==account) }
+    val relevantAccounts=matching.map { it.id }.toSet()
+    // Kategóriára szűrve csak azok a személyek számítanak, akiknek van ilyen kategóriájuk.
+    val contributors=matching.map { it.personId }.toSet()
+    if(contributors.isEmpty()) return emptyList()
+    fun dayStart(timestamp:Long):Long = Calendar.getInstance().apply {
+        timeInMillis=timestamp
+        set(Calendar.HOUR_OF_DAY,0);set(Calendar.MINUTE,0);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0)
+    }.timeInMillis
+    val from=dayStart(start)
+    val until=dayStart(end)
     val relevant=l.snapshots.filter { snap ->
-        snap.personId in selected && snap.timestamp<=end &&
+        snap.personId in contributors && snap.timestamp<=end &&
             snap.entries.any { it.accountId in relevantAccounts }
-    }.sortedBy { it.timestamp }
+    }.sortedWith(compareBy<Snapshot> { it.timestamp }.thenBy { it.id })
     if(relevant.isEmpty()) return emptyList()
-    val firstValid=relevant.first().timestamp
-    val moments=relevant.map { it.timestamp }.filter { it>=start }.distinct().sorted()
-    val hasOpening=firstValid<start
-    val times=(if(hasOpening) listOf(start) else emptyList())+moments
-    return times.distinct().sorted().map { t ->
-        val amount=selected.sumOf { pid ->
-            val latest=l.snapshots.filter { it.personId==pid && it.timestamp<=t &&
-                it.entries.any { entry -> entry.accountId in relevantAccounts } }.maxByOrNull { it.timestamp }
-            latest?.entries?.filter { it.accountId in relevantAccounts }?.sumOf { it.value } ?: 0L
+    // Naponként pontosan egy pont: a nap végéig ismert legutolsó állapot személyenként.
+    // Amíg nincs minden érintett személyhez ismert állapot, nem rajzolunk hiányzó adatból 0 Ft-ot.
+    val days=relevant.map { dayStart(it.timestamp) }.filter { it in from..until }.distinct().sorted()
+    val openingKnown=contributors.all { pid -> relevant.any { it.personId==pid && it.timestamp<from } }
+    val plotDays=(if(openingKnown) listOf(from) else emptyList())+days
+    return plotDays.distinct().sorted().mapNotNull { day ->
+        val nextDay=Calendar.getInstance().apply { timeInMillis=day;add(Calendar.DAY_OF_MONTH,1) }.timeInMillis
+        val cutoff=if(day==from && openingKnown) from else nextDay
+        val latestByPerson=contributors.associateWith { pid ->
+            relevant.lastOrNull { it.personId==pid && it.timestamp<cutoff }
         }
-        val note=if(t==start && hasOpening) "" else relevant.filter { it.timestamp==t && it.note.isNotBlank() }.joinToString("; ") { it.note }
-        Point(t,amount,note)
+        if(latestByPerson.values.any { it==null }) return@mapNotNull null
+        val total=latestByPerson.values.filterNotNull().sumOf { snapshot ->
+            snapshot.entries.filter { it.accountId in relevantAccounts }.sumOf { it.value }
+        }
+        val note=if(day==from && openingKnown) "" else relevant.filter {
+            dayStart(it.timestamp)==day && it.note.isNotBlank()
+        }.joinToString("; ") { it.note }
+        Point(day,total,note)
     }
 }
-@Composable private fun ChartView(points:List<Point>) {
-    if(points.isEmpty()) return
-    val values=points.map { it.amount.toFloat() }
-    val min=values.minOrNull() ?: 0f;val max=values.maxOrNull() ?: 1f
-    val span=(max-min).coerceAtLeast(1f)
-    Canvas(Modifier.fillMaxWidth().height(210.dp).background(card,RoundedCornerShape(16.dp)).padding(20.dp)) {
-        val w=size.width;val h=size.height
-        for(i in 0..4) { val y=h*i/4f;drawLine(Color(0xFF344056),Offset(0f,y),Offset(w,y),strokeWidth=1.dp.toPx()) }
-        val first=points.first().time;val duration=(points.last().time-first).coerceAtLeast(1L).toFloat()
-        val coords=points.map { Offset((it.time-first)/duration*w, h-(it.amount-min)/span*h) }
-        if(coords.size==1) drawCircle(accent,radius=5.dp.toPx(),center=coords.first())
-        coords.zipWithNext().forEach { (a,b) -> drawLine(accent,a,b,strokeWidth=3.dp.toPx(),cap=StrokeCap.Round) }
-        coords.forEachIndexed { index,p -> if(index==0 || index==coords.lastIndex || points[index].note.isNotBlank()) drawCircle(if(points[index].note.isNotBlank()) Color(0xFFFFD07A) else accent,radius=4.dp.toPx(),center=p) }
+private data class PlotSeries(val label:String,val color:Color,val points:List<Point>)
+private val chartColors=listOf(Color(0xFF7DCBFF),Color(0xFFFFD07A),Color(0xFFD7A5FF),Color(0xFF75E4B0),Color(0xFFFF8F9D),Color(0xFF8B91FF))
+private fun axisMoney(v:Double):String = when {
+    kotlin.math.abs(v)>=1_000_000 -> String.format(Locale("hu","HU"),"%.1f M",v/1_000_000)
+    kotlin.math.abs(v)>=1_000 -> String.format(Locale("hu","HU"),"%.0f e",v/1_000)
+    else -> String.format(Locale("hu","HU"),"%.0f",v)
+}
+@Composable private fun ChartView(series:List<PlotSeries>) {
+    val visible=series.filter { it.points.isNotEmpty() }
+    if(visible.isEmpty()) return
+    val all=visible.flatMap { it.points }
+    val low=all.minOf { it.amount }.toDouble()
+    val high=all.maxOf { it.amount }.toDouble()
+    val padding=(high-low).coerceAtLeast(kotlin.math.abs(high)*0.03).coerceAtLeast(1.0)*0.12
+    val min=low-padding;val max=high+padding
+    val first=all.minOf { it.time };val last=all.maxOf { it.time }
+    val duration=(last-first).coerceAtLeast(1L).toDouble()
+    val formatter=SimpleDateFormat("MM.dd",Locale("hu","HU"))
+    Canvas(Modifier.fillMaxWidth().height(265.dp).background(card,RoundedCornerShape(16.dp)).padding(10.dp)) {
+        val left=58.dp.toPx();val right=12.dp.toPx();val top=12.dp.toPx();val bottom=28.dp.toPx()
+        val w=(size.width-left-right).coerceAtLeast(1f)
+        val h=(size.height-top-bottom).coerceAtLeast(1f)
+        val paint=android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color=android.graphics.Color.rgb(185,196,214);textSize=10.sp.toPx()
+        }
+        for(i in 0..4) {
+            val y=top+h*i/4f
+            drawLine(Color(0xFF344056),Offset(left,y),Offset(left+w,y),strokeWidth=1.dp.toPx())
+            paint.textAlign=android.graphics.Paint.Align.RIGHT
+            drawContext.canvas.nativeCanvas.drawText(axisMoney(max-(max-min)*i/4),left-6.dp.toPx(),y+3.dp.toPx(),paint)
+        }
+        val ticks=if(first==last) 1 else 4
+        paint.textAlign=android.graphics.Paint.Align.CENTER
+        for(i in 0..ticks) {
+            val fraction=if(ticks==1) 0.5 else i.toDouble()/ticks
+            val x=left+w*fraction.toFloat()
+            val t=first+(duration*fraction).toLong()
+            drawContext.canvas.nativeCanvas.drawText(formatter.format(Date(t)),x,top+h+18.dp.toPx(),paint)
+        }
+        visible.forEach { line ->
+            val coords=line.points.sortedBy { it.time }.map { p ->
+                Offset(left+((p.time-first)/duration*w).toFloat(),top+((max-p.amount)/(max-min)*h).toFloat())
+            }
+            coords.zipWithNext().forEach { (p,q) -> drawLine(line.color,p,q,strokeWidth=2.5.dp.toPx(),cap=StrokeCap.Round) }
+            coords.forEach { drawCircle(line.color,radius=3.dp.toPx(),center=it) }
+        }
+    }
+    Column(Modifier.fillMaxWidth().padding(top=10.dp),verticalArrangement=Arrangement.spacedBy(7.dp)) {
+        visible.chunked(2).forEach { row ->
+            Row(horizontalArrangement=Arrangement.spacedBy(16.dp)) {
+                row.forEach { item ->
+                    Row(verticalAlignment=Alignment.CenterVertically) {
+                        Box(Modifier.size(10.dp).background(item.color,RoundedCornerShape(50)))
+                        Spacer(Modifier.width(6.dp))
+                        Text(item.label,fontSize=12.sp,color=muted)
+                    }
+                }
+            }
+        }
     }
 }
 @Composable private fun DateButton(label:String,ts:Long,onPick:(Long)->Unit) {
@@ -346,9 +408,18 @@ private fun timeline(l:Ledger,person:String,account:String,start:Long,end:Long):
     var menu by remember { mutableStateOf(false) }
     val names=l.accounts.filter { person=="ALL" || it.personId==person }.map { it.name }.distinct().sorted()
     val points=remember(l,person,account,start,end) { timeline(l,person,account,start,end+86_399_999L) }
+    val chartSeries=remember(l,person,account,start,end) {
+        if(person=="ALL" && account=="ALL") {
+            l.people.mapIndexed { index,p ->
+                PlotSeries(p.name,chartColors[index%chartColors.size],timeline(l,p.id,"ALL",start,end+86_399_999L))
+            } + PlotSeries("Család összesen",accent,points)
+        } else {
+            listOf(PlotSeries(if(person=="ALL") "Család összesen" else (l.people.find { it.id==person }?.name ?: "Kiválasztott személy"),accent,points))
+        }
+    }
     val opening=points.firstOrNull()?.amount ?: 0L;val closing=points.lastOrNull()?.amount ?: 0L;val delta=closing-opening
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        Heading("Statisztika","Személyenként, kategóriánként vagy összesen")
+        Heading("Statisztika","Családi összehasonlítás vagy egy személy grafikonja")
         PersonTabs(l,person,{person=it;account="ALL"},all=true)
         Column(Modifier.padding(18.dp)) {
             Box { OutlinedButton(onClick={menu=true},modifier=Modifier.fillMaxWidth()) { Icon(Icons.Default.FilterList,null);Spacer(Modifier.width(8.dp));Text(if(account=="ALL")"Összes kategória" else account) }
@@ -377,7 +448,7 @@ private fun timeline(l:Ledger,person:String,account:String,start:Long,end:Long):
             Spacer(Modifier.height(8.dp))
             if(points.isNotEmpty() && opening!=0L) Text(String.format(Locale("hu","HU"),"%+.2f%%",delta*100.0/opening),color=if(delta>=0)green else red)
             Spacer(Modifier.height(14.dp))
-            ChartView(points)
+            ChartView(chartSeries)
             Row(Modifier.fillMaxWidth().padding(top=12.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)) {
                 Box(Modifier.weight(1f)) { Metric("Nyitó állomány",money(opening)) }
                 Box(Modifier.weight(1f)) { Metric("Záró állomány",money(closing)) }
