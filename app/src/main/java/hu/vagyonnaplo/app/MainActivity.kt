@@ -291,24 +291,28 @@ class MainActivity: ComponentActivity() {
 
 private data class Point(val time:Long,val amount:Long,val note:String)
 private fun timeline(l:Ledger,person:String,account:String,start:Long,end:Long):List<Point> {
-    val selected=if(person=="ALL") l.people.map { it.id } else listOf(person)
-    val moments=l.snapshots.filter { it.personId in selected && it.timestamp<=end }.map { it.timestamp }.distinct().sorted()
-    val result=mutableListOf<Point>()
-    for(t in moments) {
-        if(t<start) continue
-        val sum=selected.sumOf { pid ->
-            val latest=l.snapshots.filter { it.personId==pid && it.timestamp<=t }.maxByOrNull { it.timestamp }
-            latest?.entries?.filter { e -> account=="ALL" || l.accounts.find { it.id==e.accountId }?.name==account }?.sumOf { it.value } ?: 0L
+    val selected=if(person=="ALL") l.people.map { it.id }.toSet() else setOf(person)
+    val relevantAccounts=l.accounts.filter { it.personId in selected && (account=="ALL" || it.name==account) }.map { it.id }.toSet()
+    // A grafikon csak az első ténylegesen rögzített, kiválasztott egyenlegtől indul.
+    // A 0 Ft valódi mentett érték lehet; a hiányzó előzmény viszont NEM nulla.
+    val relevant=l.snapshots.filter { snap ->
+        snap.personId in selected && snap.timestamp<=end &&
+            snap.entries.any { it.accountId in relevantAccounts }
+    }.sortedBy { it.timestamp }
+    if(relevant.isEmpty()) return emptyList()
+    val firstValid=relevant.first().timestamp
+    val moments=relevant.map { it.timestamp }.filter { it>=start }.distinct().sorted()
+    val hasOpening=firstValid<start
+    val times=(if(hasOpening) listOf(start) else emptyList())+moments
+    return times.distinct().sorted().map { t ->
+        val amount=selected.sumOf { pid ->
+            val latest=l.snapshots.filter { it.personId==pid && it.timestamp<=t &&
+                it.entries.any { entry -> entry.accountId in relevantAccounts } }.maxByOrNull { it.timestamp }
+            latest?.entries?.filter { it.accountId in relevantAccounts }?.sumOf { it.value } ?: 0L
         }
-        val note=l.snapshots.filter { it.timestamp==t && it.note.isNotBlank() }.joinToString("; ") { it.note }
-        result.add(Point(t,sum,note))
+        val note=if(t==start && hasOpening) "" else relevant.filter { it.timestamp==t && it.note.isNotBlank() }.joinToString("; ") { it.note }
+        Point(t,amount,note)
     }
-    // Include the last known opening balance at start, even if no entry was made exactly then.
-    val opening=selected.sumOf { pid ->
-        val latest=l.snapshots.filter { it.personId==pid && it.timestamp<=start }.maxByOrNull { it.timestamp }
-        latest?.entries?.filter { e -> account=="ALL" || l.accounts.find { it.id==e.accountId }?.name==account }?.sumOf { it.value } ?: 0L
-    }
-    return listOf(Point(start,opening,"")) + result.filter { it.time>start }
 }
 @Composable private fun ChartView(points:List<Point>) {
     if(points.isEmpty()) return
@@ -334,7 +338,10 @@ private fun timeline(l:Ledger,person:String,account:String,start:Long,end:Long):
 @Composable private fun Stats(l:Ledger) {
     var person by remember { mutableStateOf("ALL") }
     var account by remember { mutableStateOf("ALL") }
-    var start by remember { mutableLongStateOf(System.currentTimeMillis()-365L*24*3600*1000) }
+    var period by remember { mutableStateOf("MONTH") }
+    val now=System.currentTimeMillis()
+    val monthStart=Calendar.getInstance().apply { set(Calendar.DAY_OF_MONTH,1);set(Calendar.HOUR_OF_DAY,0);set(Calendar.MINUTE,0);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0) }.timeInMillis
+    var start by remember { mutableLongStateOf(monthStart) }
     var end by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var menu by remember { mutableStateOf(false) }
     val names=l.accounts.filter { person=="ALL" || it.personId==person }.map { it.name }.distinct().sorted()
@@ -347,14 +354,28 @@ private fun timeline(l:Ledger,person:String,account:String,start:Long,end:Long):
             Box { OutlinedButton(onClick={menu=true},modifier=Modifier.fillMaxWidth()) { Icon(Icons.Default.FilterList,null);Spacer(Modifier.width(8.dp));Text(if(account=="ALL")"Összes kategória" else account) }
                 DropdownMenu(expanded=menu,onDismissRequest={menu=false}) { (listOf("ALL" to "Összes kategória")+names.map { it to it }).forEach { (key,label)->DropdownMenuItem(text={Text(label)},onClick={account=key;menu=false}) } }
             }
-            Row(horizontalArrangement=Arrangement.spacedBy(6.dp)) { listOf("1 hó" to 30L,"3 hó" to 90L,"1 év" to 365L,"Mind" to 36500L).forEach { (label,days)->AssistChip(onClick={end=System.currentTimeMillis();start=end-days*86_400_000L},label={Text(label,fontSize=11.sp)}) } }
-            DateButton("Kezdet",start,{start=it})
-            DateButton("Vége",end,{end=it})
+            Row(horizontalArrangement=Arrangement.spacedBy(6.dp)) {
+                listOf("MONTH" to "Aktuális hónap", "YEAR" to "1 év", "CUSTOM" to "Egyéni").forEach { (key,label) ->
+                    FilterChip(selected=period==key,onClick={
+                        period=key
+                        if(key=="MONTH") {
+                            start=Calendar.getInstance().apply { set(Calendar.DAY_OF_MONTH,1);set(Calendar.HOUR_OF_DAY,0);set(Calendar.MINUTE,0);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0) }.timeInMillis
+                            end=System.currentTimeMillis()
+                        } else if(key=="YEAR") {
+                            val cal=Calendar.getInstance().apply { set(Calendar.HOUR_OF_DAY,0);set(Calendar.MINUTE,0);set(Calendar.SECOND,0);set(Calendar.MILLISECOND,0);add(Calendar.YEAR,-1) }
+                            start=cal.timeInMillis
+                            end=System.currentTimeMillis()
+                        }
+                    },label={Text(label,fontSize=11.sp)})
+                }
+            }
+            DateButton("Kezdet",start,{start=it;period="CUSTOM"})
+            DateButton("Vége",end,{end=it;period="CUSTOM"})
             if(start>end) { Text("A kezdődátum nem lehet későbbi a záródátumnál.",color=red);return@Column }
             Spacer(Modifier.height(10.dp))
-            Metric("Változás a kiválasztott időszakban",signed(delta),if(delta>0)green else if(delta<0)red else Color.White)
+            Metric("Változás a kiválasztott időszakban",if(points.isEmpty()) "Nincs adat" else signed(delta),if(delta>0)green else if(delta<0)red else Color.White)
             Spacer(Modifier.height(8.dp))
-            if(opening!=0L) Text(String.format(Locale("hu","HU"),"%+.2f%%",delta*100.0/opening),color=if(delta>=0)green else red)
+            if(points.isNotEmpty() && opening!=0L) Text(String.format(Locale("hu","HU"),"%+.2f%%",delta*100.0/opening),color=if(delta>=0)green else red)
             Spacer(Modifier.height(14.dp))
             ChartView(points)
             Row(Modifier.fillMaxWidth().padding(top=12.dp),horizontalArrangement=Arrangement.spacedBy(10.dp)) {
@@ -366,7 +387,7 @@ private fun timeline(l:Ledger,person:String,account:String,start:Long,end:Long):
             points.filter { it.note.isNotBlank() }.reversed().forEach { p ->
                 Column(Modifier.fillMaxWidth().padding(top=8.dp).background(card,RoundedCornerShape(12.dp)).padding(12.dp)) { Text(date(p.time),color=muted,fontSize=12.sp);Text(p.note);Text(money(p.amount),color=accent) }
             }
-            if(l.snapshots.isEmpty()) Text("Még nincs rögzített állapot. Az első mentés után itt jelenik meg a grafikon.",color=muted,modifier=Modifier.padding(12.dp))
+            if(points.isEmpty()) Text("A kiválasztott időszakban még nincs rögzített adat. A grafikon az első tényleges mentéstől indul.",color=muted,modifier=Modifier.padding(12.dp))
         }
     }
 }
